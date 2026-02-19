@@ -7,6 +7,9 @@ Single program with two stages:
 1) Resolve the runtime address of android_os_Process_setArgV0.
 2) Scan zygote64 heap for a pointer to that address.
 
+adb shell pidof zygote64
+adb logcat -b crash
+
 Build (NDK, x86_64)
 ------------------
 Example:
@@ -15,12 +18,11 @@ C:\Users\qiuguo\AppData\Local\Android\Sdk\ndk\28.2.13676358\toolchains\llvm\preb
 Run (on emulator)
 -----------------
   adb push find_art_method_slot /data/local/tmp/
-  adb shell su -c /data/local/tmp/find_art_method_slot
 
-   adb shell su -c "ls -l /data/local/tmp/find_art_method_slot; chmod 755 /data/local/tmp/find_art_method_slot; ls -l /
+  adb shell su -c "ls -l /data/local/tmp/find_art_method_slot; chmod 755 /data/local/tmp/find_art_method_slot; ls -l /
   data/local/tmp/find_art_method_slot"
 
-  adb shell su -c "/data/local/tmp/find_art_method_slot --pid 491 "
+  adb shell su -c "/data/local/tmp/find_art_method_slot --pid 22758"
 
 Options
 -------
