@@ -27,7 +27,3 @@ Run (on emulator)
 Options
 -------
   --pid <pid>   use a specific process instead of zygote64
-  --pause       pause after printing the symbol address
-  --scan-all-readable  scan all readable mappings (slower)
-  --no-rw       include non-writable readable mappings
-  --debug-maps  print candidate mappings selected for scan

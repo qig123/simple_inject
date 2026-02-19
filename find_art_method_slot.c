@@ -1,5 +1,6 @@
 #include <ctype.h>
 #include <dirent.h>
+#include <dlfcn.h>
 #include <elf.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -14,8 +15,12 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#define LOG_TAG "HOOK_TEST"
+#define LOG_MSG "Hello from Zymbiote Payload!"
 #define TARGET_PROC_NAME "zygote64"
 #define TARGET_LIB_NAME "libandroid_runtime.so"
+#define TARGET_LIB_LOG_NAME "liblog.so"
+#define TARGET_LOG_SYMBOL "__android_log_write"
 #define TARGET_SYMBOL                                                          \
   "_Z27android_os_Process_setArgV0P7_JNIEnvP8_jobjectP8_jstring"
 
@@ -109,9 +114,8 @@ static bool parse_maps_line(const char *line, map_entry_t *out) {
   return true;
 }
 
-// 查找目标库的信息（基址和路径）
-static bool find_lib_info(int pid, lib_info_t *out) {
-  if (!out)
+static bool find_lib_info(int pid, const char *lib_name, lib_info_t *out) {
+  if (!out || !lib_name)
     return false;
   memset(out, 0, sizeof(*out));
 
@@ -130,7 +134,7 @@ static bool find_lib_info(int pid, lib_info_t *out) {
     map_entry_t e;
     if (!parse_maps_line(line, &e))
       continue;
-    if (!str_contains(e.path, TARGET_LIB_NAME))
+    if (!str_contains(e.path, lib_name)) // 使用传入的参数
       continue;
     if (e.offset != 0) // 只取第一个LOAD段作为基址
       continue;
@@ -148,7 +152,6 @@ static bool find_lib_info(int pid, lib_info_t *out) {
   strncpy(out->path, best_path, sizeof(out->path) - 1);
   return true;
 }
-
 // 将vaddr转换为文件偏移
 static bool vaddr_to_offset(const Elf64_Phdr *phdrs, int phnum, uint64_t vaddr,
                             uint64_t *out_off) {
@@ -498,39 +501,19 @@ static int collect_readable_maps(int pid, map_entry_t **out_maps,
 uint64_t find_payload_cave(int pid) {
   char map_path[64];
   snprintf(map_path, sizeof(map_path), "/proc/%d/maps", pid);
-
   FILE *fp = fopen(map_path, "r");
-  if (!fp) {
-    perror("[-] Failed to open maps");
+  if (!fp)
     return 0;
-  }
-
   char line[1024];
   uint64_t start, end;
   char perms[16];
-  char path[256];
   uint64_t target_addr = 0;
-
-  printf("[*] Scanning maps for libstagefright.so...\n");
-
   while (fgets(line, sizeof(line), fp)) {
-    // 筛选包含 libstagefright.so 的行
-    if (strstr(line, "libstagefright.so")) {
-      // 解析行: start-end perms ... path
-      // 例子: 76b0eb131000-76b0eb2ff000 r-xp ...
+    if (strstr(line, "libstagefright.so") &&
+        strstr(line, "r-xp")) { // 必须带 x 权限
       sscanf(line, "%lx-%lx %s", &start, &end, perms);
-
-      // 必须是可执行段 (r-xp)
-      if (strstr(perms, "x")) { // 只要包含 'x' 即可，通常是 r-xp
-        // 找到了！
-        // 这里的 end 是这一段内存的结束位置。
-        // 内存分页通常是 4096 (0x1000) 对齐的，而代码通常填不满最后一页。
-        // 我们往回退 0x200 (512字节)，这块地方通常全是 0 (Padding)
-        target_addr = end - 0x200;
-        printf("[+] Found executable segment: %lx-%lx [%s]\n", start, end,
-               perms);
-        break;
-      }
+      target_addr = end - 0x300; // 留多一点空间给字符串
+      break;
     }
   }
   fclose(fp);
@@ -565,7 +548,7 @@ int main(int argc, char **argv) {
 
   // 查找目标库信息
   lib_info_t lib;
-  if (!find_lib_info(pid, &lib)) {
+  if (!find_lib_info(pid, TARGET_LIB_NAME, &lib)) {
     die("libandroid_runtime.so not found in target process");
   }
 
@@ -591,10 +574,10 @@ int main(int argc, char **argv) {
   }
 
   // 打开进程内存
-  char mem_path[64];
-  snprintf(mem_path, sizeof(mem_path), "/proc/%d/mem", pid);
+  char mem_path2[64];
+  snprintf(mem_path2, sizeof(mem_path2), "/proc/%d/mem", pid);
 
-  int mem_fd = open(mem_path, O_RDONLY);
+  int mem_fd = open(mem_path2, O_RDONLY);
   if (mem_fd < 0) {
     free(maps);
     die("failed to open /proc/<pid>/mem (need root)");
@@ -627,57 +610,144 @@ int main(int argc, char **argv) {
   printf("[+] setArgV0 absolute address: 0x%016" PRIx64 "\n", sym_runtime);
   // 1. 自动寻找 Payload 存放位置
   uint64_t payload_addr = find_payload_cave(pid);
-  if (payload_addr == 0) {
-    printf("[-] Could not find a suitable place in libstagefright.so\n");
+  if (!payload_addr) {
+    printf("[-] Can't find code cave\n");
     return 1;
   }
-  printf("[+] Calculated Payload Address: %lx\n", payload_addr);
 
-  // 2. 准备 payload (x86_64 汇编: 恢复Slot并跳转)
-  uint8_t payload[64];
-  int idx = 0;
+  // 查找目标库信息
+  lib_info_t log_lib;
+  if (!find_lib_info(pid, TARGET_LIB_LOG_NAME, &log_lib)) {
+    die("liblog.so not found in target process");
+  }
 
+  // 查找符号在文件中的偏移
+  uint64_t log_offset = 0;
+  if (!find_symbol_offset(log_lib.path, TARGET_LOG_SYMBOL, &log_offset)) {
+    die("failed to find symbol offset in liblog.so");
+  }
+
+  // 计算符号在内存中的绝对地址
+  uint64_t sym_log = log_lib.base + log_offset;
+
+  printf("[*] Payload Cave: %lx\n", payload_addr);
+  printf("[*] Log Function: %lx (Offset: %lx)\n", sym_log, log_offset);
+  // 2. 构造超级 Payload (Hex 数组)
+  uint8_t code[512];
+  int i = 0;
+
+  // --- A. 保存寄存器 (8个寄存器，保持对齐) ---
+  code[i++] = 0x57; // push rdi
+  code[i++] = 0x56; // push rsi
+  code[i++] = 0x52; // push rdx
+  code[i++] = 0x51; // push rcx
+  code[i++] = 0x50; // push rax
+  code[i++] = 0x41;
+  code[i++] = 0x50; // push r8
+  code[i++] = 0x41;
+  code[i++] = 0x51; // push r9
+  code[i++] = 0x41;
+  code[i++] = 0x52; // push r10
+
+  // --- B. 准备参数调用 LogWrite ---
+  // Arg1: RDI = 4 (INFO)
+  code[i++] = 0x48;
+  code[i++] = 0xc7;
+  code[i++] = 0xc7;
+  code[i++] = 0x04;
+  code[i++] = 0x00;
+  code[i++] = 0x00;
+  code[i++] = 0x00;
+
+  // Arg2: RSI = Tag 地址
+  int tag_offset_pos = i + 3;
+  code[i++] = 0x48;
+  code[i++] = 0x8d;
+  code[i++] = 0x35; // lea rsi, [rip + X]
+  code[i++] = 0x00;
+  code[i++] = 0x00;
+  code[i++] = 0x00;
+  code[i++] = 0x00;
+
+  // Arg3: RDX = Msg 地址
+  int msg_offset_pos = i + 3;
+  code[i++] = 0x48;
+  code[i++] = 0x8d;
+  code[i++] = 0x15; // lea rdx, [rip + X]
+  code[i++] = 0x00;
+  code[i++] = 0x00;
+  code[i++] = 0x00;
+  code[i++] = 0x00;
+
+  // 调用 __android_log_write (用 R11 中转)
+  code[i++] = 0x49;
+  code[i++] = 0xbb;
+  memcpy(&code[i], &sym_log, 8);
+  i += 8;
+  code[i++] = 0x41;
+  code[i++] = 0xff;
+  code[i++] = 0xd3; // call r11
+
+  // --- C. 恢复寄存器 ---
+  code[i++] = 0x41;
+  code[i++] = 0x5a; // pop r10
+  code[i++] = 0x41;
+  code[i++] = 0x59; // pop r9
+  code[i++] = 0x41;
+  code[i++] = 0x58; // pop r8
+  code[i++] = 0x58; // pop rax
+  code[i++] = 0x59; // pop rcx
+  code[i++] = 0x5a; // pop rdx
+  code[i++] = 0x5e; // pop rsi
+  code[i++] = 0x5f; // pop rdi
+
+  // --- D. 恢复 Slot 并跳转 ---
   // mov rax, SLOT_ADDR
-  payload[idx++] = 0x48;
-  payload[idx++] = 0xb8;
-  memcpy(&payload[idx], &slot, 8);
-  idx += 8;
-
+  code[i++] = 0x48;
+  code[i++] = 0xb8;
+  memcpy(&code[i], &slot, 8);
+  i += 8;
   // mov rcx, ORIG_ADDR
-  payload[idx++] = 0x48;
-  payload[idx++] = 0xb9;
-  memcpy(&payload[idx], &sym_runtime, 8);
-  idx += 8;
+  code[i++] = 0x48;
+  code[i++] = 0xb9;
+  memcpy(&code[i], &sym_runtime, 8);
+  i += 8;
+  // mov [rax], rcx
+  code[i++] = 0x48;
+  code[i++] = 0x89;
+  code[i++] = 0x08;
+  // jmp rcx
+  code[i++] = 0xff;
+  code[i++] = 0xe1;
 
-  // mov [rax], rcx  (恢复指针)
-  payload[idx++] = 0x48;
-  payload[idx++] = 0x89;
-  payload[idx++] = 0x08;
+  // --- E. 填充字符串 ---
+  // 自动计算偏移，防止算错
+  int current_len = i;
 
-  // jmp rcx (跳转回原函数)
-  payload[idx++] = 0xff;
-  payload[idx++] = 0xe1;
+  int tag_offset = current_len - (tag_offset_pos + 4);
+  memcpy(&code[tag_offset_pos], &tag_offset, 4);
+  strcpy((char *)&code[i], LOG_TAG);
+  i += strlen(LOG_TAG) + 1;
 
-  printf("[*] Generated %d bytes of machine code.\n", idx);
+  int msg_offset = current_len + strlen(LOG_TAG) + 1 - (msg_offset_pos + 4);
+  memcpy(&code[msg_offset_pos], &msg_offset, 4);
+  strcpy((char *)&code[i], LOG_MSG);
+  i += strlen(LOG_MSG) + 1;
 
-  // 3. 打开内存写入
-  char mem_path2[64];
-  snprintf(mem_path2, sizeof(mem_path2), "/proc/%d/mem", pid);
-  int fd = open(mem_path2, O_RDWR);
+  // 写入
+  char mem_path[64];
+  snprintf(mem_path, sizeof(mem_path), "/proc/%d/mem", pid);
+  int fd = open(mem_path, O_RDWR);
   if (fd < 0) {
-    perror("[-] Failed to open /proc/pid/mem (Root required?)");
+    perror("open mem");
     return 1;
   }
 
-  // 4. 写入 Payload
-  printf("[*] Injecting payload to: %lx\n", payload_addr);
-  write_mem(fd, payload_addr, payload, idx);
-
-  // 5. 修改 Slot 指向 Payload
-  printf("[*] Overwriting ArtMethod Slot: %lx\n", slot);
+  printf("[*] Injecting %d bytes...\n", i);
+  write_mem(fd, payload_addr, code, i);
   write_mem(fd, slot, &payload_addr, 8);
 
   close(fd);
-  printf("[SUCCESS] Injection complete! Launch an app to test.\n");
+  printf("[SUCCESS] Simple Log Injection Done.\n");
   return 0;
 }
