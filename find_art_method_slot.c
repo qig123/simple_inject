@@ -5,9 +5,11 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -492,7 +494,59 @@ static int collect_readable_maps(int pid, map_entry_t **out_maps,
   *out_count = count;
   return 0;
 }
+// 自动寻找 Payload 地址的函数
+uint64_t find_payload_cave(int pid) {
+  char map_path[64];
+  snprintf(map_path, sizeof(map_path), "/proc/%d/maps", pid);
 
+  FILE *fp = fopen(map_path, "r");
+  if (!fp) {
+    perror("[-] Failed to open maps");
+    return 0;
+  }
+
+  char line[1024];
+  uint64_t start, end;
+  char perms[16];
+  char path[256];
+  uint64_t target_addr = 0;
+
+  printf("[*] Scanning maps for libstagefright.so...\n");
+
+  while (fgets(line, sizeof(line), fp)) {
+    // 筛选包含 libstagefright.so 的行
+    if (strstr(line, "libstagefright.so")) {
+      // 解析行: start-end perms ... path
+      // 例子: 76b0eb131000-76b0eb2ff000 r-xp ...
+      sscanf(line, "%lx-%lx %s", &start, &end, perms);
+
+      // 必须是可执行段 (r-xp)
+      if (strstr(perms, "x")) { // 只要包含 'x' 即可，通常是 r-xp
+        // 找到了！
+        // 这里的 end 是这一段内存的结束位置。
+        // 内存分页通常是 4096 (0x1000) 对齐的，而代码通常填不满最后一页。
+        // 我们往回退 0x200 (512字节)，这块地方通常全是 0 (Padding)
+        target_addr = end - 0x200;
+        printf("[+] Found executable segment: %lx-%lx [%s]\n", start, end,
+               perms);
+        break;
+      }
+    }
+  }
+  fclose(fp);
+  return target_addr;
+}
+
+void write_mem(int fd, uint64_t addr, void *data, size_t len) {
+  if (lseek64(fd, (off64_t)addr, SEEK_SET) == -1) {
+    perror("[-] lseek failed");
+    exit(1);
+  }
+  if (write(fd, data, len) != len) {
+    perror("[-] write failed");
+    exit(1);
+  }
+}
 int main(int argc, char **argv) {
   int pid = -1;
 
@@ -571,7 +625,59 @@ int main(int argc, char **argv) {
   printf("[+] Slot value: 0x%016" PRIx64 "\n", slot_value);
   // set_arg_v0的绝对地址
   printf("[+] setArgV0 absolute address: 0x%016" PRIx64 "\n", sym_runtime);
-  //
+  // 1. 自动寻找 Payload 存放位置
+  uint64_t payload_addr = find_payload_cave(pid);
+  if (payload_addr == 0) {
+    printf("[-] Could not find a suitable place in libstagefright.so\n");
+    return 1;
+  }
+  printf("[+] Calculated Payload Address: %lx\n", payload_addr);
 
+  // 2. 准备 payload (x86_64 汇编: 恢复Slot并跳转)
+  uint8_t payload[64];
+  int idx = 0;
+
+  // mov rax, SLOT_ADDR
+  payload[idx++] = 0x48;
+  payload[idx++] = 0xb8;
+  memcpy(&payload[idx], &slot, 8);
+  idx += 8;
+
+  // mov rcx, ORIG_ADDR
+  payload[idx++] = 0x48;
+  payload[idx++] = 0xb9;
+  memcpy(&payload[idx], &sym_runtime, 8);
+  idx += 8;
+
+  // mov [rax], rcx  (恢复指针)
+  payload[idx++] = 0x48;
+  payload[idx++] = 0x89;
+  payload[idx++] = 0x08;
+
+  // jmp rcx (跳转回原函数)
+  payload[idx++] = 0xff;
+  payload[idx++] = 0xe1;
+
+  printf("[*] Generated %d bytes of machine code.\n", idx);
+
+  // 3. 打开内存写入
+  char mem_path2[64];
+  snprintf(mem_path2, sizeof(mem_path2), "/proc/%d/mem", pid);
+  int fd = open(mem_path2, O_RDWR);
+  if (fd < 0) {
+    perror("[-] Failed to open /proc/pid/mem (Root required?)");
+    return 1;
+  }
+
+  // 4. 写入 Payload
+  printf("[*] Injecting payload to: %lx\n", payload_addr);
+  write_mem(fd, payload_addr, payload, idx);
+
+  // 5. 修改 Slot 指向 Payload
+  printf("[*] Overwriting ArtMethod Slot: %lx\n", slot);
+  write_mem(fd, slot, &payload_addr, 8);
+
+  close(fd);
+  printf("[SUCCESS] Injection complete! Launch an app to test.\n");
   return 0;
 }
