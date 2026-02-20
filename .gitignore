@@ -19,6 +19,7 @@ build.ninja
 *.dylib
 *.exe
 *.out
+*.bin
 
 # Debugging artifacts
 *.pdb

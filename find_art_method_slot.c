@@ -12,8 +12,6 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#define LOG_TAG "HOOK_TEST"
-#define LOG_MSG "Hello from Zymbiote Payload!"
 #define TARGET_PROC_NAME "zygote64"
 #define TARGET_LIB_NAME "libandroid_runtime.so"
 #define TARGET_LIB_LOG_NAME "liblog.so"
@@ -69,165 +67,110 @@ static void format_proc_path(char *buf, size_t size, int pid,
                              const char *file) {
   snprintf(buf, size, "/proc/%d/%s", pid, file);
 }
-// 构建 Shellcode 的辅助函数
-void build_log_payload(uint8_t *buffer, int *out_len, uint64_t log_func_addr,
-                       uint64_t slot_addr, uint64_t orig_func_addr,
-                       const char *tag_str, const char *msg_str) {
-  int idx = 0;
 
-  // ==========================================
-  // Part 1: 保存现场 (Save Context)
-  // 关键修正：Push 15 个寄存器 (15 * 8 = 120 bytes)
-  // 假设进入时 RSP 结尾是 8，减去 120 后结尾是 0 (16字节对齐)
-  // ==========================================
-  uint8_t pushes[] = {
-      0x50,       // push rax
-      0x53,       // push rbx
-      0x51,       // push rcx
-      0x52,       // push rdx
-      0x57,       // push rdi
-      0x56,       // push rsi
-      0x55,       // push rbp
-      0x41, 0x50, // push r8
-      0x41, 0x51, // push r9
-      0x41, 0x52, // push r10
-      0x41, 0x53, // push r11
-      0x41, 0x54, // push r12
-      0x41, 0x55, // push r13
-      0x41, 0x56, // push r14
-      0x41, 0x57  // push r15  <-- 新增这个，凑成奇数
-  };
-  memcpy(&buffer[idx], pushes, sizeof(pushes));
-  idx += sizeof(pushes);
+#define PAYLOAD_PATH "/data/local/tmp/payload.bin"
+#define PLACEHOLDER_LOG 0x1111111111111111ULL
+#define PLACEHOLDER_ORIG 0x2222222222222222ULL
+#define PLACEHOLDER_SLOT 0x3333333333333333ULL
 
-  // ==========================================
-  // Part 2: 准备参数
-  // ==========================================
+static uint8_t *load_file(const char *path, size_t *out_size) {
+  FILE *f = fopen(path, "rb");
+  if (!f)
+    return NULL;
 
-  // 1. RDI = Priority (3 = DEBUG)
-  buffer[idx++] = 0x48;
-  buffer[idx++] = 0xc7;
-  buffer[idx++] = 0xc7;
-  buffer[idx++] = 0x03;
-  buffer[idx++] = 0x00;
-  buffer[idx++] = 0x00;
-  buffer[idx++] = 0x00;
+  if (fseek(f, 0, SEEK_END) != 0) {
+    fclose(f);
+    return NULL;
+  }
+  long size = ftell(f);
+  if (size <= 0) {
+    fclose(f);
+    return NULL;
+  }
+  if (fseek(f, 0, SEEK_SET) != 0) {
+    fclose(f);
+    return NULL;
+  }
 
-  // 2. 清空 RAX (变参函数必须)
-  buffer[idx++] = 0x31;
-  buffer[idx++] = 0xc0;
+  uint8_t *buf = malloc((size_t)size);
+  if (!buf) {
+    fclose(f);
+    return NULL;
+  }
 
-  // 3. 相对寻址 RSI (Tag)
-  buffer[idx++] = 0x48;
-  buffer[idx++] = 0x8d;
-  buffer[idx++] = 0x35;
-  int offset_tag_pos = idx;
-  buffer[idx++] = 0x00;
-  buffer[idx++] = 0x00;
-  buffer[idx++] = 0x00;
-  buffer[idx++] = 0x00;
+  if (fread(buf, 1, (size_t)size, f) != (size_t)size) {
+    free(buf);
+    fclose(f);
+    return NULL;
+  }
 
-  // 4. 相对寻址 RDX (Msg)
-  buffer[idx++] = 0x48;
-  buffer[idx++] = 0x8d;
-  buffer[idx++] = 0x15;
-  int offset_msg_pos = idx;
-  buffer[idx++] = 0x00;
-  buffer[idx++] = 0x00;
-  buffer[idx++] = 0x00;
-  buffer[idx++] = 0x00;
-
-  // ==========================================
-  // Part 3: 调用 Log
-  // ==========================================
-  buffer[idx++] = 0x49;
-  buffer[idx++] = 0xbb;
-  memcpy(&buffer[idx], &log_func_addr, 8);
-  idx += 8;
-
-  // call r11
-  // 此时 RSP 应该是 16字节对齐的，否则 liblog 会崩
-  buffer[idx++] = 0x41;
-  buffer[idx++] = 0xff;
-  buffer[idx++] = 0xd3;
-
-  // ==========================================
-  // Part 4: 恢复现场 (反向 Pop)
-  // ==========================================
-  uint8_t pops[] = {
-      0x41, 0x5f, // pop r15   <-- 对应 pop
-      0x41, 0x5e, // pop r14
-      0x41, 0x5d, // pop r13
-      0x41, 0x5c, // pop r12
-      0x41, 0x5b, // pop r11
-      0x41, 0x5a, // pop r10
-      0x41, 0x59, // pop r9
-      0x41, 0x58, // pop r8
-      0x5d,       // pop rbp
-      0x5e,       // pop rsi
-      0x5f,       // pop rdi
-      0x5a,       // pop rdx
-      0x59,       // pop rcx
-      0x5b,       // pop rbx
-      0x58        // pop rax
-  };
-  memcpy(&buffer[idx], pops, sizeof(pops));
-  idx += sizeof(pops);
-
-  // ==========================================
-  // Part 5: 恢复 Hook 并跳转
-  // ==========================================
-
-  // mov rax, slot_addr
-  buffer[idx++] = 0x48;
-  buffer[idx++] = 0xb8;
-  memcpy(&buffer[idx], &slot_addr, 8);
-  idx += 8;
-
-  // mov rcx, orig_func_addr
-  buffer[idx++] = 0x48;
-  buffer[idx++] = 0xb9;
-  memcpy(&buffer[idx], &orig_func_addr, 8);
-  idx += 8;
-
-  // mov [rax], rcx
-  buffer[idx++] = 0x48;
-  buffer[idx++] = 0x89;
-  buffer[idx++] = 0x08;
-
-  // jmp rcx
-  buffer[idx++] = 0xff;
-  buffer[idx++] = 0xe1;
-
-  // ==========================================
-  // Part 6: 填充数据区
-  // ==========================================
-
-  // Tag String
-  int tag_start_idx = idx;
-  strcpy((char *)&buffer[idx], tag_str);
-  idx += strlen(tag_str) + 1;
-
-  // Msg String
-  int msg_start_idx = idx;
-  strcpy((char *)&buffer[idx], msg_str);
-  idx += strlen(msg_str) + 1;
-
-  // 回填偏移量
-  int32_t tag_rel_offset = tag_start_idx - (offset_tag_pos + 4);
-  memcpy(&buffer[offset_tag_pos], &tag_rel_offset, 4);
-
-  int32_t msg_rel_offset = msg_start_idx - (offset_msg_pos + 4);
-  memcpy(&buffer[offset_msg_pos], &msg_rel_offset, 4);
-
-  *out_len = idx;
+  fclose(f);
+  *out_size = (size_t)size;
+  return buf;
 }
+
+static size_t patch_u64_pattern(uint8_t *buf, size_t size, uint64_t pattern,
+                                uint64_t value) {
+  uint8_t pat[8];
+  uint8_t val[8];
+  memcpy(pat, &pattern, sizeof(pat));
+  memcpy(val, &value, sizeof(val));
+
+  size_t count = 0;
+  for (size_t i = 0; i + sizeof(pat) <= size; i++) {
+    if (memcmp(buf + i, pat, sizeof(pat)) == 0) {
+      memcpy(buf + i, val, sizeof(val));
+      count++;
+      i += sizeof(pat) - 1;
+    }
+  }
+  return count;
+}
+
+static void print_payload_hex(const uint8_t *buf, size_t size) {
+  const size_t bytes_per_line = 16;
+  for (size_t i = 0; i < size; i += bytes_per_line) {
+    printf("%08zx  ", i);
+    for (size_t j = 0; j < bytes_per_line; j++) {
+      if (i + j < size)
+        printf("%02x ", buf[i + j]);
+      else
+        printf("   ");
+    }
+    printf(" |");
+    for (size_t j = 0; j < bytes_per_line; j++) {
+      if (i + j < size) {
+        unsigned char c = buf[i + j];
+        if (c >= 32 && c <= 126)
+          putchar(c);
+        else
+          putchar('.');
+      } else {
+        putchar(' ');
+      }
+    }
+    printf("|");
+  }
+}
+
 int main(int argc, char **argv) {
   int target_pid = -1;
+  const char *payload_path = PAYLOAD_PATH;
+  bool dump_payload = false;
 
-  if (argc == 3 && strcmp(argv[1], "--pid") == 0) {
-    target_pid = atoi(argv[2]);
-  } else {
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "--pid") == 0 && i + 1 < argc) {
+      target_pid = atoi(argv[++i]);
+    } else if (strcmp(argv[i], "--payload") == 0 && i + 1 < argc) {
+      payload_path = argv[++i];
+    } else if (strcmp(argv[i], "--dump") == 0) {
+      dump_payload = true;
+    } else {
+      die("usage: --pid <pid> [--payload <path>] [--dump]");
+    }
+  }
+
+  if (target_pid <= 0) {
     target_pid = find_pid_by_name(TARGET_PROC_NAME);
     if (target_pid <= 0)
       die("zygote64 process not found. Please specify PID with --pid <pid>");
@@ -320,22 +263,38 @@ int main(int argc, char **argv) {
   printf("[*] Payload Cave: %lx\n", payload_addr);
 
   // 构造机器码
-  int len = 0;
-  uint8_t payload[1024];
 
-  build_log_payload(payload, &len, log_addr, slot_addr, setargv0_addr,
-                    "INJECTOR", "Success from C!");
+  size_t payload_size = 0;
+  uint8_t *payload = load_file(payload_path, &payload_size);
+  if (!payload)
+    die("failed to load payload file");
+
+  size_t patched_log =
+      patch_u64_pattern(payload, payload_size, PLACEHOLDER_LOG, log_addr);
+  size_t patched_orig =
+      patch_u64_pattern(payload, payload_size, PLACEHOLDER_ORIG, setargv0_addr);
+  size_t patched_slot =
+      patch_u64_pattern(payload, payload_size, PLACEHOLDER_SLOT, slot_addr);
+
+  if (patched_log == 0 || patched_orig == 0 || patched_slot == 0) {
+    free(payload);
+    die("failed to patch payload placeholders");
+  }
+
   format_proc_path(mem_path, sizeof(mem_path), target_pid, "mem");
   int fd = open(mem_path, O_RDWR);
   if (fd < 0) {
     perror("open mem");
+    free(payload);
     return 1;
   }
 
-  printf("Payload generated, size: %d bytes\n", len);
-  write_mem(fd, payload_addr, payload, len);
-  write_mem(fd, slot_addr, &payload_addr, 8);
-
+  printf("Payload size: %zu bytes\n", payload_size);
+  if (dump_payload)
+    print_payload_hex(payload, payload_size);
+  // write_mem(fd, payload_addr, payload, payload_size);
+  // write_mem(fd, slot_addr, &payload_addr, 8);
+  free(payload);
   close(fd);
   printf("[SUCCESS] Simple Log Injection Done.\n");
   return 0;
