@@ -17,7 +17,7 @@
 #define TARGET_PROC_NAME "zygote64"
 #define TARGET_LIB_NAME "libandroid_runtime.so"
 #define TARGET_LIB_LOG_NAME "liblog.so"
-#define TARGET_LOG_SYMBOL "__android_log_write"
+#define TARGET_LOG_SYMBOL "__android_log_print"
 #define TARGET_LIB_SLEEP_NAME "libc.so"
 #define TARGET_SLEEP_SYMBOL "sleep"
 #define TARGET_SYMBOL                                                          \
@@ -45,7 +45,7 @@ static uint64_t find_payload_cave(int pid) {
   while (fgets(line, sizeof(line), fp)) {
     if (strstr(line, "libstagefright.so") && strstr(line, "r-xp")) {
       sscanf(line, "%lx-%lx %15s", &start, &end, perms);
-      target_addr = end - 0x300;
+      target_addr = end - 0x400;
       break;
     }
   }
@@ -69,7 +69,159 @@ static void format_proc_path(char *buf, size_t size, int pid,
                              const char *file) {
   snprintf(buf, size, "/proc/%d/%s", pid, file);
 }
+// 构建 Shellcode 的辅助函数
+void build_log_payload(uint8_t *buffer, int *out_len, uint64_t log_func_addr,
+                       uint64_t slot_addr, uint64_t orig_func_addr,
+                       const char *tag_str, const char *msg_str) {
+  int idx = 0;
 
+  // ==========================================
+  // Part 1: 保存现场 (Save Context)
+  // 关键修正：Push 15 个寄存器 (15 * 8 = 120 bytes)
+  // 假设进入时 RSP 结尾是 8，减去 120 后结尾是 0 (16字节对齐)
+  // ==========================================
+  uint8_t pushes[] = {
+      0x50,       // push rax
+      0x53,       // push rbx
+      0x51,       // push rcx
+      0x52,       // push rdx
+      0x57,       // push rdi
+      0x56,       // push rsi
+      0x55,       // push rbp
+      0x41, 0x50, // push r8
+      0x41, 0x51, // push r9
+      0x41, 0x52, // push r10
+      0x41, 0x53, // push r11
+      0x41, 0x54, // push r12
+      0x41, 0x55, // push r13
+      0x41, 0x56, // push r14
+      0x41, 0x57  // push r15  <-- 新增这个，凑成奇数
+  };
+  memcpy(&buffer[idx], pushes, sizeof(pushes));
+  idx += sizeof(pushes);
+
+  // ==========================================
+  // Part 2: 准备参数
+  // ==========================================
+
+  // 1. RDI = Priority (3 = DEBUG)
+  buffer[idx++] = 0x48;
+  buffer[idx++] = 0xc7;
+  buffer[idx++] = 0xc7;
+  buffer[idx++] = 0x03;
+  buffer[idx++] = 0x00;
+  buffer[idx++] = 0x00;
+  buffer[idx++] = 0x00;
+
+  // 2. 清空 RAX (变参函数必须)
+  buffer[idx++] = 0x31;
+  buffer[idx++] = 0xc0;
+
+  // 3. 相对寻址 RSI (Tag)
+  buffer[idx++] = 0x48;
+  buffer[idx++] = 0x8d;
+  buffer[idx++] = 0x35;
+  int offset_tag_pos = idx;
+  buffer[idx++] = 0x00;
+  buffer[idx++] = 0x00;
+  buffer[idx++] = 0x00;
+  buffer[idx++] = 0x00;
+
+  // 4. 相对寻址 RDX (Msg)
+  buffer[idx++] = 0x48;
+  buffer[idx++] = 0x8d;
+  buffer[idx++] = 0x15;
+  int offset_msg_pos = idx;
+  buffer[idx++] = 0x00;
+  buffer[idx++] = 0x00;
+  buffer[idx++] = 0x00;
+  buffer[idx++] = 0x00;
+
+  // ==========================================
+  // Part 3: 调用 Log
+  // ==========================================
+  buffer[idx++] = 0x49;
+  buffer[idx++] = 0xbb;
+  memcpy(&buffer[idx], &log_func_addr, 8);
+  idx += 8;
+
+  // call r11
+  // 此时 RSP 应该是 16字节对齐的，否则 liblog 会崩
+  buffer[idx++] = 0x41;
+  buffer[idx++] = 0xff;
+  buffer[idx++] = 0xd3;
+
+  // ==========================================
+  // Part 4: 恢复现场 (反向 Pop)
+  // ==========================================
+  uint8_t pops[] = {
+      0x41, 0x5f, // pop r15   <-- 对应 pop
+      0x41, 0x5e, // pop r14
+      0x41, 0x5d, // pop r13
+      0x41, 0x5c, // pop r12
+      0x41, 0x5b, // pop r11
+      0x41, 0x5a, // pop r10
+      0x41, 0x59, // pop r9
+      0x41, 0x58, // pop r8
+      0x5d,       // pop rbp
+      0x5e,       // pop rsi
+      0x5f,       // pop rdi
+      0x5a,       // pop rdx
+      0x59,       // pop rcx
+      0x5b,       // pop rbx
+      0x58        // pop rax
+  };
+  memcpy(&buffer[idx], pops, sizeof(pops));
+  idx += sizeof(pops);
+
+  // ==========================================
+  // Part 5: 恢复 Hook 并跳转
+  // ==========================================
+
+  // mov rax, slot_addr
+  buffer[idx++] = 0x48;
+  buffer[idx++] = 0xb8;
+  memcpy(&buffer[idx], &slot_addr, 8);
+  idx += 8;
+
+  // mov rcx, orig_func_addr
+  buffer[idx++] = 0x48;
+  buffer[idx++] = 0xb9;
+  memcpy(&buffer[idx], &orig_func_addr, 8);
+  idx += 8;
+
+  // mov [rax], rcx
+  buffer[idx++] = 0x48;
+  buffer[idx++] = 0x89;
+  buffer[idx++] = 0x08;
+
+  // jmp rcx
+  buffer[idx++] = 0xff;
+  buffer[idx++] = 0xe1;
+
+  // ==========================================
+  // Part 6: 填充数据区
+  // ==========================================
+
+  // Tag String
+  int tag_start_idx = idx;
+  strcpy((char *)&buffer[idx], tag_str);
+  idx += strlen(tag_str) + 1;
+
+  // Msg String
+  int msg_start_idx = idx;
+  strcpy((char *)&buffer[idx], msg_str);
+  idx += strlen(msg_str) + 1;
+
+  // 回填偏移量
+  int32_t tag_rel_offset = tag_start_idx - (offset_tag_pos + 4);
+  memcpy(&buffer[offset_tag_pos], &tag_rel_offset, 4);
+
+  int32_t msg_rel_offset = msg_start_idx - (offset_msg_pos + 4);
+  memcpy(&buffer[offset_msg_pos], &msg_rel_offset, 4);
+
+  *out_len = idx;
+}
 int main(int argc, char **argv) {
   int target_pid = -1;
 
@@ -140,99 +292,39 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  lib_info_t sleep_lib;
-  if (!find_lib_info(target_pid, TARGET_LIB_SLEEP_NAME, &sleep_lib))
+  // lib_info_t sleep_lib;
+  // if (!find_lib_info(target_pid, TARGET_LIB_SLEEP_NAME, &sleep_lib))
+  //   die("liblog.so not found in target process");
+
+  // uint64_t sleep_offset = 0;
+  // if (!find_symbol_offset(sleep_lib.path, TARGET_SLEEP_SYMBOL,
+  // &sleep_offset))
+  //   die("failed to find symbol offset in libc.so");
+
+  // uint64_t sleep_addr = sleep_lib.base + sleep_offset;
+  // printf("[*] uSleep Function: %lx (Offset: %lx)\n", sleep_addr,
+  // sleep_offset);
+
+  lib_info_t log_lib;
+  if (!find_lib_info(target_pid, TARGET_LIB_LOG_NAME, &log_lib))
     die("liblog.so not found in target process");
 
-  uint64_t sleep_offset = 0;
-  if (!find_symbol_offset(sleep_lib.path, TARGET_SLEEP_SYMBOL, &sleep_offset))
+  uint64_t log_offset = 0;
+  if (!find_symbol_offset(log_lib.path, TARGET_LOG_SYMBOL, &log_offset))
     die("failed to find symbol offset in libc.so");
 
-  uint64_t sleep_addr = sleep_lib.base + sleep_offset;
+  uint64_t log_addr = log_lib.base + log_offset;
+  printf("[*] __android_log_print Function: %lx (Offset: %lx)\n", log_addr,
+         log_offset);
 
   printf("[*] Payload Cave: %lx\n", payload_addr);
-  printf("[*] uSleep Function: %lx (Offset: %lx)\n", sleep_addr, sleep_offset);
 
-  uint8_t code[512];
-  int idx = 0;
+  // 构造机器码
+  int len = 0;
+  uint8_t payload[1024];
 
-  // ================= 1. 保存现场 =================
-  // 我们成对Push，确保16字节对齐 (8个寄存器 = 64字节)
-  code[idx++] = 0x50; // push rax
-  code[idx++] = 0x53; // push rbx
-  code[idx++] = 0x51; // push rcx
-  code[idx++] = 0x52; // push rdx
-  code[idx++] = 0x57; // push rdi
-  code[idx++] = 0x56; // push rsi
-  code[idx++] = 0x41;
-  code[idx++] = 0x50; // push r8
-  code[idx++] = 0x41;
-  code[idx++] = 0x51; // push r9
-  // 注意：如果原程序调用处栈已经对齐，这里 Push 8次(64字节)后依然对齐。
-  // 如果崩了，尝试多 Push 一个 r10。
-
-  // ================= 2. 准备参数调用 sleep(5) =================
-  // sleep(unsigned int seconds) -> RDI = 5
-
-  code[idx++] = 0x48;
-  code[idx++] = 0xc7;
-  code[idx++] = 0xc7;
-  code[idx++] = 0x09;
-  code[idx++] = 0x00;
-  code[idx++] = 0x00;
-  code[idx++] = 0x00;
-  // mov rdi, 5  (睡眠5秒)
-
-  // ================= 3. 调用函数 =================
-  code[idx++] = 0x49;
-  code[idx++] = 0xbb;
-  memcpy(&code[idx], &sleep_addr, 8); // 把 sleep 的绝对地址塞进去
-  idx += 8;                           // mov r11, sleep_addr
-
-  code[idx++] = 0x41;
-  code[idx++] = 0xff;
-  code[idx++] = 0xd3;
-  // call r11
-
-  // ================= 4. 恢复现场 =================
-  // 顺序与 Push 相反
-  code[idx++] = 0x41;
-  code[idx++] = 0x59; // pop r9
-  code[idx++] = 0x41;
-  code[idx++] = 0x58; // pop r8
-  code[idx++] = 0x5e; // pop rsi
-  code[idx++] = 0x5f; // pop rdi
-  code[idx++] = 0x5a; // pop rdx
-  code[idx++] = 0x59; // pop rcx
-  code[idx++] = 0x5b; // pop rbx
-  code[idx++] = 0x58; // pop rax
-
-  // ================= 5. 修复 Hook 并跳回 =================
-  // 这里要把原来的函数指针写回去，保证只执行这一次 shellcode，以后正常运行
-  // slot_addr 是存放函数指针的内存地址
-  // setargv0_addr 是原本的函数地址
-
-  // mov rax, slot_addr
-  code[idx++] = 0x48;
-  code[idx++] = 0xb8;
-  memcpy(&code[idx], &slot_addr, 8);
-  idx += 8;
-
-  // mov rcx, setargv0_addr
-  code[idx++] = 0x48;
-  code[idx++] = 0xb9;
-  memcpy(&code[idx], &setargv0_addr, 8);
-  idx += 8;
-
-  // mov [rax], rcx  -> 恢复内存中的指针
-  code[idx++] = 0x48;
-  code[idx++] = 0x89;
-  code[idx++] = 0x08;
-
-  // jmp rcx -> 跳回原函数执行
-  code[idx++] = 0xff;
-  code[idx++] = 0xe1;
-
+  build_log_payload(payload, &len, log_addr, slot_addr, setargv0_addr,
+                    "INJECTOR", "Success from C!");
   format_proc_path(mem_path, sizeof(mem_path), target_pid, "mem");
   int fd = open(mem_path, O_RDWR);
   if (fd < 0) {
@@ -240,8 +332,8 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  printf("[*] Injecting %d bytes...\n", idx);
-  write_mem(fd, payload_addr, code, idx);
+  printf("Payload generated, size: %d bytes\n", len);
+  write_mem(fd, payload_addr, payload, len);
   write_mem(fd, slot_addr, &payload_addr, 8);
 
   close(fd);
