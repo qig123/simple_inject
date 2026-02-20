@@ -19,7 +19,7 @@
 #define TARGET_LIB_LOG_NAME "liblog.so"
 #define TARGET_LOG_SYMBOL "__android_log_write"
 #define TARGET_LIB_SLEEP_NAME "libc.so"
-#define TARGET_SLEEP_SYMBOL "usleep"
+#define TARGET_SLEEP_SYMBOL "sleep"
 #define TARGET_SYMBOL                                                          \
   "_Z27android_os_Process_setArgV0P7_JNIEnvP8_jobjectP8_jstring"
 
