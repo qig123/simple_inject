@@ -1,0 +1,37 @@
+# Build outputs
+build/
+out/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+build.ninja
+.ninja_*
+
+# Object/library files
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dll
+*.dylib
+*.exe
+*.out
+
+# Debugging artifacts
+*.pdb
+*.ilk
+*.exp
+*.dSYM/
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*.bak
+
+# Local binaries
+find_art_method_slot
